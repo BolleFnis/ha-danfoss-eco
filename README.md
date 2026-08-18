@@ -31,7 +31,7 @@ Not supported :
 
 ### HACS (recommended)
 
-1. HACS → Integrations → ⋮ → Custom repositories → add `https://github.com/Clap404/danfoss_eco_ha` as type _Integration_.
+1. HACS → Integrations → ⋮ → Custom repositories → add `https://github.com/Clap404/ha-danfoss-eco` as type _Integration_.
 2. Install **Danfoss Eco (eTRV)**, restart Home Assistant.
 
 ### Manual
@@ -61,4 +61,4 @@ Huge thanks to the original authors for reverse engineering and publishing their
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Compatible with upstream MIT licensing of the projects above.
+MIT — see [`LICENSE`](LICENSE.md). Compatible with upstream MIT licensing of the projects above.
