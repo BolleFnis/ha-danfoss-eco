@@ -32,6 +32,7 @@ from .etrv.properties import (
     Battery,
     CurrentTime,
     Errors,
+    Schedule,
     Settings,
     Temperature,
 )
@@ -65,6 +66,7 @@ class ETRVState:
     settings: Settings | None
     errors: Errors | None
     current_time: CurrentTime | None
+    schedule: Schedule | None
     rssi: int | None
 
 
@@ -87,6 +89,8 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
         self._pending_settings: Settings | None = None
         self._flush_handle: asyncio.TimerHandle | None = None
         self._flush_task: asyncio.Task | None = None
+        # Device Information Service values are static; read once, then cache.
+        self.device_information: dict[str, str] = {}
 
         super().__init__(
             hass,
@@ -130,6 +134,14 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug("current_time read failed: %s", exc)
                 current_time = None
+            try:
+                schedule = await client.read_schedule()
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("schedule read failed: %s", exc)
+                schedule = None
+            # Device Information Service is static — read it only once.
+            if not self.device_information:
+                self.device_information = await client.read_device_information()
         finally:
             await client.disconnect()
 
@@ -140,6 +152,7 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
             settings=settings,
             errors=errors,
             current_time=current_time,
+            schedule=schedule,
             rssi=rssi,
         )
 
@@ -184,6 +197,18 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
         self._pending_settings = settings
         self._optimistic_update(settings=settings)
         self._arm_flush()
+
+    async def async_write_schedule(self, schedule: Schedule) -> None:
+        """Write the weekly schedule (3 characteristics) in one session.
+
+        Not debounced — schedule edits are infrequent and come as a whole.
+        """
+
+        async def body(client):
+            await client.write_schedule(schedule)
+
+        await self._run_session("write_schedule", body)
+        self._optimistic_update(schedule=schedule)
 
     # --- debounced flush -----------------------------------------------------
 
