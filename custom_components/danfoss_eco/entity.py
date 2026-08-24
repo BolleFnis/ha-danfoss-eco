@@ -16,10 +16,16 @@ class ETRVEntity(CoordinatorEntity[ETRVCoordinator]):
         super().__init__(coordinator)
         mac = format_mac(coordinator.address)
         self._attr_unique_id = f"{mac}_{key}"
+        # Device Information Service values (read once by the coordinator) enrich
+        # the HA device registry when available.
+        dis = coordinator.device_information
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, mac)},
-            manufacturer="Danfoss",
-            model="Eco (eTRV)",
+            manufacturer=dis.get("manufacturer", "Danfoss"),
+            model=dis.get("model_number", "Eco (eTRV)"),
             name=coordinator.entry.title,
             connections={("bluetooth", coordinator.address)},
+            sw_version=dis.get("firmware_revision") or dis.get("software_revision"),
+            hw_version=dis.get("hardware_revision"),
+            serial_number=dis.get("serial_number"),
         )
