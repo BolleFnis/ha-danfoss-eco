@@ -24,13 +24,19 @@ from ..const import (
     UUID_BATTERY_LEVEL,
     UUID_CURRENT_TIME,
     UUID_ERRORS,
+    UUID_FIRMWARE_REVISION,
+    UUID_HARDWARE_REVISION,
+    UUID_MANUFACTURER,
+    UUID_MODEL_NUMBER,
     UUID_NAME,
     UUID_PIN,
     UUID_SCHEDULE_1,
     UUID_SCHEDULE_2,
     UUID_SCHEDULE_3,
     UUID_SECRET_KEY,
+    UUID_SERIAL_NUMBER,
     UUID_SETTINGS,
+    UUID_SOFTWARE_REVISION,
     UUID_TEMPERATURE,
 )
 from . import crypto
@@ -50,6 +56,18 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_PIN = b"0000"
 CONNECT_TIMEOUT = 30.0
 CONNECT_ATTEMPTS = 4
+
+
+def convert_pin(pin: bytes) -> bytes:
+    """Encode a 4-digit ASCII PIN the way the device expects it.
+
+    The official app (CharacteristicWriter.convertPin) treats the PIN as a
+    decimal integer and writes it as a 4-byte big-endian value — e.g. "1234"
+    → 0x000004D2, "0000" → 0x00000000. This is *not* the ASCII bytes. PINs
+    other than the factory default would silently fail with the old encoding.
+    """
+    text = pin.decode("ascii").strip() or "0"
+    return int(text).to_bytes(4, "big")
 
 
 class ETRVClient:
@@ -119,7 +137,7 @@ class ETRVClient:
         if self._pin_sent:
             return
         assert self._client is not None
-        await self._client.write_gatt_char(UUID_PIN, self._pin, response=True)
+        await self._client.write_gatt_char(UUID_PIN, convert_pin(self._pin), response=True)
         self._pin_sent = True
 
     # --- low-level read/write -------------------------------------------------
@@ -194,6 +212,36 @@ class ETRVClient:
     async def read_secret_key(self) -> SecretKey:
         """Plaintext read — only succeeds while the device is in pairing mode."""
         return SecretKey.parse(await self._read_raw(UUID_SECRET_KEY))
+
+    # --- Device Information Service (standard 0x180A, plaintext strings) ------
+
+    async def _read_string(self, uuid: str) -> str:
+        return bytes(await self._read_raw(uuid)).decode("utf-8", errors="replace").strip("\x00 ")
+
+    async def read_device_information(self) -> dict[str, str]:
+        """Read the standard Device Information Service characteristics.
+
+        Values are static, so callers typically read this once and cache it.
+        Missing characteristics are skipped rather than failing the whole read.
+        """
+        fields = {
+            "firmware_revision": UUID_FIRMWARE_REVISION,
+            "software_revision": UUID_SOFTWARE_REVISION,
+            "hardware_revision": UUID_HARDWARE_REVISION,
+            "serial_number": UUID_SERIAL_NUMBER,
+            "model_number": UUID_MODEL_NUMBER,
+            "manufacturer": UUID_MANUFACTURER,
+        }
+        info: dict[str, str] = {}
+        for name, uuid in fields.items():
+            try:
+                value = await self._read_string(uuid)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("DIS read %s failed: %s", name, exc)
+                continue
+            if value:
+                info[name] = value
+        return info
 
 
 @asynccontextmanager
