@@ -1,13 +1,13 @@
 """Climate entity for Danfoss eTRV.
 
-Maps the device's `schedule_mode` to HA HVAC modes:
-  - MANUAL    → HEAT       (target_temperature controls valve)
-  - SCHEDULED → HEAT       (device's internal schedule; not editable from HA)
-  - VACATION  → HEAT + preset "vacation"
-  - HOLD      → HEAT + preset "hold"
+Maps the device's operating `Mode` to HA HVAC modes:
+  - MANUAL   → HEAT       (target_temperature controls the valve)
+  - SCHEDULE → AUTO       (device runs its internal weekly schedule)
+  - VACATION → preset "vacation" over the return mode's HVAC mode
+  - PAUSE    → preset "pause"    over the return mode's HVAC mode
 
-Frost protection is exposed as preset "frost" (selecting it switches the
-device to MANUAL and applies the frost_protection_temperature).
+Frost protection is exposed as HVAC OFF (switches the device to MANUAL and
+applies the frost_protection_temperature).
 """
 
 from __future__ import annotations
@@ -27,25 +27,23 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 from .coordinator import ETRVCoordinator
 from .entity import ETRVEntity
-from .etrv.properties import ScheduleMode
+from .etrv.properties import Mode, Settings
 
 PRESET_NONE = "none"
 PRESET_VACATION = "vacation"
-PRESET_HOLD = "hold"
+PRESET_PAUSE = "pause"
 
 _MODE_TO_HVAC = {
-    ScheduleMode.MANUAL: HVACMode.HEAT,
-    ScheduleMode.SCHEDULED: HVACMode.HEAT,
-    ScheduleMode.VACATION: HVACMode.HEAT,
-    ScheduleMode.HOLD: HVACMode.HEAT,
+    Mode.MANUAL: HVACMode.HEAT,
+    Mode.SCHEDULE: HVACMode.AUTO,
 }
 
-_MODE_TO_PRESET = {
-    ScheduleMode.MANUAL: PRESET_NONE,
-    ScheduleMode.SCHEDULED: PRESET_NONE,
-    ScheduleMode.VACATION: PRESET_VACATION,
-    ScheduleMode.HOLD: PRESET_HOLD,
-}
+
+def _hvac_for_mode(mode: Mode, return_mode: Mode) -> HVACMode:
+    """The HVAC mode to show. For vacation/pause, show the underlying mode."""
+    if mode in (Mode.VACATION, Mode.PAUSE):
+        return _MODE_TO_HVAC.get(return_mode, HVACMode.AUTO)
+    return _MODE_TO_HVAC.get(mode, HVACMode.HEAT)
 
 
 async def async_setup_entry(
@@ -60,8 +58,8 @@ class ETRVClimate(ETRVEntity, ClimateEntity):
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_precision = PRECISION_HALVES
     _attr_target_temperature_step = 0.5
-    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT]
-    _attr_preset_modes = [PRESET_NONE, PRESET_VACATION, PRESET_HOLD]
+    _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.AUTO]
+    _attr_preset_modes = [PRESET_NONE, PRESET_VACATION, PRESET_PAUSE]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.PRESET_MODE
@@ -99,25 +97,36 @@ class ETRVClimate(ETRVEntity, ClimateEntity):
         s = self.coordinator.data.settings if self.coordinator.data else None
         if not s:
             return None
-        # Frost-protection setpoint → treat as OFF
+        # Frost-protection setpoint while in MANUAL → treat as OFF
         t = self.coordinator.data.temperature
         if (
-            t
+            s.mode == Mode.MANUAL
+            and t
             and s.frost_protection_temperature
             and abs(t.set_point - s.frost_protection_temperature) < 0.25
         ):
-            if s.schedule_mode == ScheduleMode.MANUAL:
-                return HVACMode.OFF
-        return _MODE_TO_HVAC.get(s.schedule_mode, HVACMode.HEAT)
+            return HVACMode.OFF
+        return _hvac_for_mode(s.mode, s.return_mode)
 
     @property
     def preset_mode(self) -> str | None:
         s = self.coordinator.data.settings if self.coordinator.data else None
         if not s:
             return None
-        return _MODE_TO_PRESET.get(s.schedule_mode, PRESET_NONE)
+        if s.mode == Mode.VACATION:
+            return PRESET_VACATION
+        if s.mode == Mode.PAUSE:
+            return PRESET_PAUSE
+        return PRESET_NONE
 
     # --- commands ------------------------------------------------------------
+
+    @staticmethod
+    def _base_mode(settings: Settings) -> Mode:
+        """The non-overlay mode (what vacation/pause returns to)."""
+        if settings.mode in (Mode.MANUAL, Mode.SCHEDULE):
+            return settings.mode
+        return settings.return_mode if settings.return_mode in (Mode.MANUAL, Mode.SCHEDULE) else Mode.MANUAL
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         temp = kwargs.get(ATTR_TEMPERATURE)
@@ -131,15 +140,19 @@ class ETRVClimate(ETRVEntity, ClimateEntity):
             return
         settings = data.settings
         if hvac_mode == HVACMode.OFF:
-            # Set MANUAL + frost protection temperature
-            settings.schedule_mode = ScheduleMode.MANUAL
+            settings.mode = Mode.MANUAL
+            settings.return_mode = Mode.MANUAL
             await self.coordinator.async_write_settings(settings)
             await self.coordinator.async_write_target_temperature(
                 settings.frost_protection_temperature
             )
             return
         if hvac_mode == HVACMode.HEAT:
-            settings.schedule_mode = ScheduleMode.MANUAL
+            settings.mode = Mode.MANUAL
+            settings.return_mode = Mode.MANUAL
+        elif hvac_mode == HVACMode.AUTO:
+            settings.mode = Mode.SCHEDULE
+            settings.return_mode = Mode.SCHEDULE
         else:
             return
         await self.coordinator.async_write_settings(settings)
@@ -150,11 +163,13 @@ class ETRVClimate(ETRVEntity, ClimateEntity):
             return
         settings = data.settings
         if preset_mode == PRESET_NONE:
-            settings.schedule_mode = ScheduleMode.MANUAL
+            settings.mode = self._base_mode(settings)
         elif preset_mode == PRESET_VACATION:
-            settings.schedule_mode = ScheduleMode.VACATION
-        elif preset_mode == PRESET_HOLD:
-            settings.schedule_mode = ScheduleMode.HOLD
+            settings.return_mode = self._base_mode(settings)
+            settings.mode = Mode.VACATION
+        elif preset_mode == PRESET_PAUSE:
+            settings.return_mode = self._base_mode(settings)
+            settings.mode = Mode.PAUSE
         else:
             return
         await self.coordinator.async_write_settings(settings)
