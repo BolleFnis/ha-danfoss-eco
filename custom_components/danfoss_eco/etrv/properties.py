@@ -24,11 +24,46 @@ def _t2b(temp: float) -> int:
     return int(round(temp * 2))
 
 
-class ScheduleMode(IntEnum):
+class Mode(IntEnum):
+    """Operating mode. The device stores mode *and* the mode to return to
+    (after vacation/pause) packed into a single settings byte:
+
+        0 → MANUAL
+        1 → SCHEDULE
+        2 → VACATION, returns to MANUAL
+        3 → VACATION, returns to SCHEDULE
+        4 → PAUSE,    returns to MANUAL
+        5 → PAUSE,    returns to SCHEDULE
+
+    Enum values mirror the official Danfoss app's `Mode`; VACATION/PAUSE carry
+    a separate `return_mode` (MANUAL or SCHEDULE). Mapping verified against
+    CharacteristicReader/Writer.parseSettings/composeSettings.
+    """
+
+    UNKNOWN = -1
     MANUAL = 0
-    SCHEDULED = 1
-    VACATION = 3
-    HOLD = 5
+    SCHEDULE = 1
+    VACATION = 2
+    PAUSE = 4
+
+    @staticmethod
+    def from_byte(b: int) -> "Mode":
+        return {0: Mode.MANUAL, 1: Mode.SCHEDULE, 2: Mode.VACATION,
+                3: Mode.VACATION, 4: Mode.PAUSE, 5: Mode.PAUSE}.get(b, Mode.MANUAL)
+
+    @staticmethod
+    def return_from_byte(b: int) -> "Mode":
+        """The mode the device reverts to when leaving vacation/pause."""
+        return Mode.SCHEDULE if b in (1, 3, 5) else Mode.MANUAL
+
+    @staticmethod
+    def to_byte(mode: "Mode", return_mode: "Mode") -> int:
+        returns_to_schedule = return_mode == Mode.SCHEDULE
+        if mode == Mode.VACATION:
+            return 3 if returns_to_schedule else 2
+        if mode == Mode.PAUSE:
+            return 5 if returns_to_schedule else 4
+        return int(mode) if mode in (Mode.MANUAL, Mode.SCHEDULE) else 0
 
 
 class ConfigBit(IntEnum):
@@ -91,12 +126,17 @@ class Settings:
     temperature_min: float
     temperature_max: float
     frost_protection_temperature: float
-    schedule_mode: ScheduleMode
+    mode: Mode
+    return_mode: Mode
     vacation_temperature: float
     vacation_from: datetime | None
     vacation_to: datetime | None
 
-    _FMT: ClassVar[str] = "<BBBBBBii2x"
+    # Big-endian: the device stores multi-byte ints big-endian (verified against
+    # the app's ByteBuffer BIG_ENDIAN reads and against live hardware — the
+    # vacation timestamps sit at bytes 6-9 / 10-13). The leading single bytes are
+    # endianness-agnostic.
+    _FMT: ClassVar[str] = ">BBBBBBii2x"
 
     @staticmethod
     def _ts_to_dt(ts: int) -> datetime | None:
@@ -112,7 +152,7 @@ class Settings:
 
     @classmethod
     def parse(cls, data: bytes) -> "Settings":
-        cfg, t_min, t_max, frost, mode, vac_t, vf, vt = struct.unpack(
+        cfg, t_min, t_max, frost, mode_byte, vac_t, vf, vt = struct.unpack(
             cls._FMT, data[: struct.calcsize(cls._FMT)]
         )
         return cls(
@@ -120,7 +160,8 @@ class Settings:
             temperature_min=_b2t(t_min),
             temperature_max=_b2t(t_max),
             frost_protection_temperature=_b2t(frost),
-            schedule_mode=ScheduleMode(mode),
+            mode=Mode.from_byte(mode_byte),
+            return_mode=Mode.return_from_byte(mode_byte),
             vacation_temperature=_b2t(vac_t),
             vacation_from=cls._ts_to_dt(vf),
             vacation_to=cls._ts_to_dt(vt),
@@ -133,7 +174,7 @@ class Settings:
             _t2b(self.temperature_min),
             _t2b(self.temperature_max),
             _t2b(self.frost_protection_temperature),
-            int(self.schedule_mode),
+            Mode.to_byte(self.mode, self.return_mode),
             _t2b(self.vacation_temperature),
             self._dt_to_ts(self.vacation_from),
             self._dt_to_ts(self.vacation_to),
@@ -164,32 +205,40 @@ class Name:
 
 @dataclass
 class CurrentTime:
-    """Characteristic 0x36 — 8 bytes encrypted. time_local is wall-clock seconds
-    since epoch in the device's local tz; time_offset is tz offset in seconds."""
+    """Characteristic uuid_epoc_time (10020008) — 8 bytes encrypted.
+
+    Wire format (matches the app's CharacteristicWriter.composeEpochTime):
+      - int32 UTC unix epoch (seconds)
+      - int32 tz offset (seconds) — the device adds this to derive local time.
+
+    `time` is stored as a timezone-aware UTC datetime. Earlier revisions sent
+    ``epoch + offset`` in the first field, which set the device clock wrong by
+    one tz offset.
+    """
 
     time: datetime | None
     offset_seconds: int
 
-    _FMT: ClassVar[str] = "<ii"
+    _FMT: ClassVar[str] = ">ii"  # device uses big-endian (app ByteBuffer default)
 
     @classmethod
     def parse(cls, data: bytes) -> "CurrentTime":
-        local, offset = struct.unpack(cls._FMT, data[: struct.calcsize(cls._FMT)])
-        if local == 0:
+        epoch, offset = struct.unpack(cls._FMT, data[: struct.calcsize(cls._FMT)])
+        if epoch == 0:
             return cls(time=None, offset_seconds=offset)
-        tz = timezone(timedelta(seconds=offset))
-        return cls(time=datetime.fromtimestamp(local, tz=tz), offset_seconds=offset)
+        return cls(time=datetime.fromtimestamp(epoch, tz=timezone.utc), offset_seconds=offset)
 
     def pack(self) -> bytes:
         if self.time is None:
             return struct.pack(self._FMT, 0, self.offset_seconds)
-        offset = self.offset_seconds
-        utc_off = self.time.utcoffset()
-        if utc_off is not None:
-            offset = int(utc_off.total_seconds())
-        # local wall-clock as seconds-since-epoch (device convention)
-        local = int(self.time.timestamp()) + offset
-        return struct.pack(self._FMT, local, offset)
+        return struct.pack(self._FMT, int(self.time.timestamp()), self.offset_seconds)
+
+    @property
+    def local_time(self) -> datetime | None:
+        """The device's wall-clock time (UTC epoch shifted by its stored offset)."""
+        if self.time is None:
+            return None
+        return self.time.astimezone(timezone(timedelta(seconds=self.offset_seconds)))
 
 
 @dataclass
@@ -212,7 +261,31 @@ class DaySchedule:
             raise ValueError("DaySchedule needs 6 bytes")
         return cls(*(b * 30 for b in data))
 
+    def validate(self) -> None:
+        """Enforce the device's constraints (mirrors WeekdaySchedule.throwIfInvalid).
+
+        Values are minutes since midnight, on a 30-minute grid, in [0, 1440].
+        Each period's start must be strictly before its end unless both are 0
+        (an unused period).
+        """
+        periods = (
+            (self.p1_start, self.p1_end),
+            (self.p2_start, self.p2_end),
+            (self.p3_start, self.p3_end),
+        )
+        for i, (start, end) in enumerate(periods, start=1):
+            for label, v in ((f"p{i}_start", start), (f"p{i}_end", end)):
+                if not 0 <= v <= 1440:
+                    raise ValueError(f"{label}={v} out of range 0..1440")
+                if v % 30 != 0:
+                    raise ValueError(f"{label}={v} must be a multiple of 30 minutes")
+            if start == 0 and end == 0:
+                continue  # unused period
+            if start >= end:
+                raise ValueError(f"period {i}: start ({start}) must be before end ({end})")
+
     def pack(self) -> bytes:
+        self.validate()
         vals = (self.p1_start, self.p1_end, self.p2_start, self.p2_end, self.p3_start, self.p3_end)
         return bytes(v // 30 for v in vals)
 
@@ -312,17 +385,18 @@ class ErrorFlag(IntEnum):
 
 @dataclass
 class Errors:
-    """Characteristic 0x39 — 16-bit sticky-fault bitfield.
+    """Characteristic uuid_error_code (10020009) — 16-bit sticky-fault bitfield.
 
-    The Danfoss app reads it as a single int16. Our local byte order matches
-    the libetrv chunk-reversal pipeline (little-endian after decrypt).
+    The app reads it big-endian (``ByteBuffer.wrap(bArr).getShort()``). Verified
+    on live hardware: an unset clock reports 0x0200 (bit 9 = E10 INVALID_CLOCK),
+    which a little-endian read would misreport as bit 1 (E2 valve sensor).
     """
 
     raw: int
 
     @classmethod
     def parse(cls, data: bytes) -> "Errors":
-        return cls(raw=int.from_bytes(data[:2], "little"))
+        return cls(raw=int.from_bytes(data[:2], "big"))
 
     @property
     def any(self) -> bool:
