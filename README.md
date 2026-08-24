@@ -16,10 +16,7 @@ Features :
 - Vacation preset (untested)
 - Battery level reporting
 - Ambient temperature reporting
-
-Not supported :
-
-- On-device schedules
+- On-device weekly schedules (read + write, see [Setting a schedule](#setting-a-schedule))
 
 ## Requirements
 
@@ -44,6 +41,23 @@ Copy `custom_components/danfoss_eco/` into your HA `config/custom_components/` d
 2. Enter the 4-digit PIN (`0000` if never changed).
 3. When prompted, **short-press the button on the TRV** — its LED goes solid. The integration reads the device's secret key during that window.
 4. If pairing times out, press the button again and retry. The window is only a few seconds.
+
+## Setting a schedule
+
+The TRV runs a weekly heating program on-device: it holds a **home** temperature during comfort periods and falls back to an **away** temperature the rest of the time. Set it with the `danfoss_eco.set_schedule` service.
+
+Go to **Settings → Devices & Services → Danfoss Eco → Configure**. Set the **home** and **away** temperatures, then type each day's comfort periods into its box:
+
+- Morning + evening block: `06:00-08:30, 16:30-22:30`
+- Up to 3 periods per day: `07:30-10:00, 12:00-14:00, 17:00-23:00`
+- Warm all day: `07:30-23:00`
+- Leave a day empty for away temperature all day.
+
+Times must land on a **30-minute grid** (`06:00`, `06:30`, …); use `00:00` as an end time to mean end-of-day. Fields are prefilled with the schedule currently on the device.
+
+The schedule only drives temperature while the thermostat is in **Auto** (schedule) mode. In **Heat** (manual) mode the TRV holds your set point and ignores the program.
+
+> The same schedule can also be set from automations/scripts via the `danfoss_eco.set_schedule` action, using the same `"start-end"` text per day.
 
 ## Notes
 

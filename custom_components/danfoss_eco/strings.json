@@ -31,10 +31,24 @@
     "step": {
       "init": {
         "title": "Danfoss eTRV options",
+        "description": "Set the weekly heating schedule. Each day is a list of comfort periods like `06:00-08:30, 16:30-22:30` (max 3, 30-minute steps). Empty means away temperature all day. The schedule applies while the thermostat is in Auto mode.",
         "data": {
-          "pin": "PIN (4 digits)"
+          "pin": "PIN (4 digits)",
+          "home_temperature": "Home temperature (during periods)",
+          "away_temperature": "Away temperature (outside periods)",
+          "monday": "Monday",
+          "tuesday": "Tuesday",
+          "wednesday": "Wednesday",
+          "thursday": "Thursday",
+          "friday": "Friday",
+          "saturday": "Saturday",
+          "sunday": "Sunday"
         }
       }
+    },
+    "error": {
+      "invalid_schedule": "Could not read the schedule. Use times like `06:00-08:30`, comma-separated, max 3 per day, on 30-minute steps.",
+      "write_failed": "Could not write the schedule to the thermostat. It may be unreachable — try again."
     }
   },
   "entity": {

@@ -43,10 +43,12 @@ set_schedule:
           unit_of_measurement: "°C"
     monday: &day
       name: Monday
-      description: 'List of periods, e.g. [{start: "06:00", end: "08:00"}].'
-      example: '[{start: "06:00", end: "08:30"}, {start: "16:00", end: "22:00"}]'
+      description: >-
+        Comfort periods as "start-end" times, comma-separated (max 3).
+        Leave empty to keep away temperature all day. Times on a 30-min grid.
+      example: "06:00-08:30, 16:30-22:30"
       selector:
-        object:
+        text:
     tuesday:
       <<: *day
       name: Tuesday

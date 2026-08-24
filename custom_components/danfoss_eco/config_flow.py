@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from copy import deepcopy
 from typing import Any
 
 import voluptuous as vol
@@ -28,7 +29,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.helpers.device_registry import format_mac
 from .const import (
     CONF_PIN,
@@ -38,6 +39,8 @@ from .const import (
     SERVICE_UUID,
 )
 from .etrv.client import ETRVClient
+from .etrv.properties import Schedule
+from .schedule_text import DAY_TO_INDEX, format_day, parse_day
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -183,13 +186,36 @@ class DanfossEcoConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class DanfossEcoOptionsFlow(OptionsFlow):
-    """Per-device options (e.g. bound HA schedule helper)."""
+    """Per-device options: PIN and the weekly heating schedule.
+
+    The schedule is edited here (Settings → Devices & Services → Configure) so
+    users never need Developer tools. Each day is a text box of comfort periods
+    like ``06:00-08:30, 16:30-22:30`` (see :mod:`.schedule_text`).
+    """
 
     # self.config_entry is provided automatically by Home Assistant.
 
+    def _coordinator(self):
+        return self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id)
+
+    def _schedule_from_input(self, base: Schedule | None, user_input: dict[str, Any]) -> Schedule:
+        schedule = deepcopy(base) if base is not None else Schedule.empty()
+        if user_input.get("home_temperature") is not None:
+            schedule.home_temperature = float(user_input["home_temperature"])
+        if user_input.get("away_temperature") is not None:
+            schedule.away_temperature = float(user_input["away_temperature"])
+        for day, index in DAY_TO_INDEX.items():
+            if day in user_input:
+                schedule.days[index] = parse_day(user_input[day])  # raises ValueError on bad text
+        return schedule
+
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        coord = self._coordinator()
+        base = coord.data.schedule if (coord and coord.data) else None
+        errors: dict[str, str] = {}
+
         if user_input is not None:
-            new_pin = (user_input.pop(CONF_PIN, "") or "").strip()
+            new_pin = (user_input.get(CONF_PIN) or "").strip()
             if (
                 new_pin
                 and new_pin.isdigit()
@@ -200,17 +226,50 @@ class DanfossEcoOptionsFlow(OptionsFlow):
                     self.config_entry,
                     data={**self.config_entry.data, CONF_PIN: new_pin},
                 )
-            return self.async_create_entry(title="", data={})
 
-        current_pin = self.config_entry.data.get(CONF_PIN, DEFAULT_PIN)
-        schema = vol.Schema(
-            {
-                vol.Optional(CONF_PIN, default=current_pin): vol.All(
-                    cv.string, vol.Length(min=4, max=4)
-                ),
-            }
+            if coord is not None and not errors:
+                try:
+                    schedule = self._schedule_from_input(base, user_input)
+                except ValueError as exc:
+                    _LOGGER.warning("invalid schedule input: %s", exc)
+                    errors["base"] = "invalid_schedule"
+                else:
+                    # Only touch the device if the schedule actually changed.
+                    if base is None or schedule != base:
+                        try:
+                            await coord.async_write_schedule(schedule)
+                        except Exception as exc:  # noqa: BLE001
+                            _LOGGER.error("schedule write failed: %s", exc)
+                            errors["base"] = "write_failed"
+
+            if not errors:
+                return self.async_create_entry(title="", data={})
+
+        current = base if base is not None else Schedule.empty()
+        defaults: dict[str, Any] = {
+            CONF_PIN: self.config_entry.data.get(CONF_PIN, DEFAULT_PIN),
+            "home_temperature": current.home_temperature,
+            "away_temperature": current.away_temperature,
+            **{day: format_day(current.days[index]) for day, index in DAY_TO_INDEX.items()},
+        }
+        if user_input is not None:
+            defaults.update(user_input)  # keep what the user just typed on error
+
+        temp_selector = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=4, max=35, step=0.5, unit_of_measurement="°C", mode=selector.NumberSelectorMode.BOX
+            )
         )
+        fields: dict[Any, Any] = {vol.Optional(CONF_PIN): selector.TextSelector()}
+        if coord is not None:
+            # Schedule editing needs a live coordinator to write to the device.
+            fields[vol.Optional("home_temperature")] = temp_selector
+            fields[vol.Optional("away_temperature")] = temp_selector
+            for day in DAY_TO_INDEX:
+                fields[vol.Optional(day)] = selector.TextSelector()
+        schema = vol.Schema(fields)
         return self.async_show_form(
             step_id="init",
-            data_schema=self.add_suggested_values_to_schema(schema, {CONF_PIN: current_pin}),
+            data_schema=self.add_suggested_values_to_schema(schema, defaults),
+            errors=errors,
         )
