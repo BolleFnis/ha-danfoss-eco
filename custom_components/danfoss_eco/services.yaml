@@ -8,3 +8,60 @@ sync_clock:
       selector:
         device:
           integration: danfoss_eco
+
+set_schedule:
+  name: Set schedule
+  description: >-
+    Write the weekly heating schedule. Any day you omit keeps its current
+    program. Each day may have up to 3 comfort periods (home temperature
+    applies inside them, away temperature outside). Times must fall on a
+    30-minute grid; use 00:00 as an end time to mean end-of-day.
+  fields:
+    device_id:
+      name: Device
+      required: true
+      selector:
+        device:
+          integration: danfoss_eco
+    home_temperature:
+      name: Home temperature
+      description: Comfort temperature during scheduled periods.
+      selector:
+        number:
+          min: 4
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    away_temperature:
+      name: Away temperature
+      description: Setback temperature outside scheduled periods.
+      selector:
+        number:
+          min: 4
+          max: 35
+          step: 0.5
+          unit_of_measurement: "°C"
+    monday: &day
+      name: Monday
+      description: 'List of periods, e.g. [{start: "06:00", end: "08:00"}].'
+      example: '[{start: "06:00", end: "08:30"}, {start: "16:00", end: "22:00"}]'
+      selector:
+        object:
+    tuesday:
+      <<: *day
+      name: Tuesday
+    wednesday:
+      <<: *day
+      name: Wednesday
+    thursday:
+      <<: *day
+      name: Thursday
+    friday:
+      <<: *day
+      name: Friday
+    saturday:
+      <<: *day
+      name: Saturday
+    sunday:
+      <<: *day
+      name: Sunday
