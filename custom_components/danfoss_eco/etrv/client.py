@@ -197,6 +197,15 @@ class ETRVClient:
     async def read_errors(self) -> Errors:
         return Errors.parse(await self._read_encrypted(UUID_ERRORS))
 
+    async def write_errors(self, errors: Errors) -> None:
+        """Write the fault word back, acknowledging every bit not set in it.
+
+        Mirrors the app's composeErrorCode / writeAlertsToThermostat: the
+        device latches faults and only drops one when the word is written back
+        without it.
+        """
+        await self._write_encrypted(UUID_ERRORS, errors.pack())
+
     async def read_schedule(self) -> Schedule:
         c1 = await self._read_encrypted(UUID_SCHEDULE_1)
         c2 = await self._read_encrypted(UUID_SCHEDULE_2)

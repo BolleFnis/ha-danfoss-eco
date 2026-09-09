@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
@@ -31,6 +32,7 @@ from .etrv.client import ETRVClient
 from .etrv.properties import (
     Battery,
     CurrentTime,
+    ErrorFlag,
     Errors,
     Schedule,
     Settings,
@@ -42,6 +44,20 @@ _LOGGER = logging.getLogger(__name__)
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
 WRITE_DEBOUNCE_S = 5.0
+# Resync the device clock once it drifts past this. The device has no crystal
+# trim and loses a minute or so a week; the app sidesteps the problem by
+# rewriting the clock on every connect.
+CLOCK_DRIFT_TOLERANCE_S = 90.0
+
+
+def _raw_utc_offset_seconds() -> int:
+    """Standard (non-DST) UTC offset in seconds.
+
+    Matches the app's ``TimeZone.getRawOffset()``: the device adds the DST hour
+    itself from the daylight_saving config bit, so sending the DST-inclusive
+    offset would double-count it for half the year.
+    """
+    return -time.timezone
 
 
 async def _with_retry(name: str, op):
@@ -139,6 +155,7 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug("schedule read failed: %s", exc)
                 schedule = None
+            current_time, errors = await self._repair_clock(client, current_time, errors)
             # Device Information Service is static — read it only once.
             if not self.device_information:
                 self.device_information = await client.read_device_information()
@@ -155,6 +172,44 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
             schedule=schedule,
             rssi=rssi,
         )
+
+    async def _repair_clock(
+        self, client: ETRVClient, current_time: CurrentTime | None, errors: Errors | None
+    ) -> tuple[CurrentTime | None, Errors | None]:
+        """Set the clock and acknowledge E10 when either is out of shape.
+
+        The device refuses to run SCHEDULE mode while INVALID_CLOCK is latched,
+        and the flag stays latched after the clock is set until the fault word is
+        written back without it. Runs inside the poll's existing session, so it
+        costs no extra connection.
+        """
+        clock_unset = current_time is not None and current_time.time is None
+        drifted = False
+        if current_time is not None and current_time.time is not None:
+            drift = abs((datetime.now(tz=timezone.utc) - current_time.time).total_seconds())
+            drifted = drift > CLOCK_DRIFT_TOLERANCE_S
+        latched = errors is not None and errors.has(ErrorFlag.INVALID_CLOCK)
+        if not (clock_unset or drifted or latched):
+            return current_time, errors
+
+        try:
+            if clock_unset or drifted:
+                now = datetime.now(tz=timezone.utc)
+                await client.write_current_time(
+                    CurrentTime(time=now, offset_seconds=_raw_utc_offset_seconds())
+                )
+                current_time = await client.read_current_time()
+            if errors is not None and latched:
+                # Acknowledge only E10 — every other bit is preserved so real
+                # faults stay visible.
+                await client.write_errors(errors.without(ErrorFlag.INVALID_CLOCK))
+                errors = await client.read_errors()
+            _LOGGER.debug(
+                "clock repaired (unset=%s drifted=%s e10=%s)", clock_unset, drifted, latched
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("clock repair failed: %s", exc)
+        return current_time, errors
 
     def _latest_rssi(self) -> int | None:
         info = bluetooth.async_last_service_info(self.hass, self.address, connectable=True)
@@ -242,7 +297,16 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
         try:
             await self._run_session("flush_writes", body)
         except Exception as exc:  # noqa: BLE001
-            _LOGGER.warning("flush_writes failed: %s", exc)
+            # Nobody is awaiting this task, so re-raising would only warn in the
+            # event loop. Log loudly and drop the optimistic state by polling —
+            # otherwise a failed mode write looks like it succeeded in the UI.
+            _LOGGER.error(
+                "flush_writes failed (setpoint=%s settings=%s): %s",
+                setpoint,
+                "yes" if settings is not None else "no",
+                exc,
+            )
+            await self.async_request_refresh()
 
     async def _flush_now(self) -> None:
         """Cancel debounce timer and await any in-flight flush."""
@@ -264,11 +328,16 @@ class ETRVCoordinator(DataUpdateCoordinator[ETRVState]):
 
     async def async_sync_clock(self) -> None:
         async def body(client):
-            now = datetime.now(tz=timezone.utc).astimezone()
-            utcoffset = now.utcoffset()
-            offset = int(utcoffset.total_seconds()) if utcoffset else 0
-            await client.write_current_time(CurrentTime(time=now, offset_seconds=offset))
+            now = datetime.now(tz=timezone.utc)
+            await client.write_current_time(
+                CurrentTime(time=now, offset_seconds=_raw_utc_offset_seconds())
+            )
+            # E10 latches: setting the clock does not clear it, and while it is
+            # set the device will not stay in SCHEDULE mode. Ack it here so a
+            # manual sync is enough to unblock schedule mode.
+            errors = await client.read_errors()
+            if errors.has(ErrorFlag.INVALID_CLOCK):
+                await client.write_errors(errors.without(ErrorFlag.INVALID_CLOCK))
 
         await self._run_session("sync_clock", body)
-        # Clock state is reflected by errors char's INVALID_CLOCK flag; let the
-        # next poll surface that change.
+        await self.async_request_refresh()

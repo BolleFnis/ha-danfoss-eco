@@ -390,6 +390,12 @@ class Errors:
     The app reads it big-endian (``ByteBuffer.wrap(bArr).getShort()``). Verified
     on live hardware: an unset clock reports 0x0200 (bit 9 = E10 INVALID_CLOCK),
     which a little-endian read would misreport as bit 1 (E2 valve sensor).
+
+    Flags latch: the device keeps a bit set until it is acknowledged by writing
+    the word back with that bit cleared (the app does this in
+    ``writeAlertsToThermostat``, rebuilding the word from its remaining alert
+    queue). A latched INVALID_CLOCK keeps the device out of SCHEDULE mode even
+    after the clock is set, so acknowledging it is required, not cosmetic.
     """
 
     raw: int
@@ -397,6 +403,18 @@ class Errors:
     @classmethod
     def parse(cls, data: bytes) -> "Errors":
         return cls(raw=int.from_bytes(data[:2], "big"))
+
+    def pack(self) -> bytes:
+        # XXTEA needs at least 8 bytes and a multiple of 4; the app's encrypt()
+        # helper zero-pads short payloads to 8 the same way.
+        return struct.pack(">H", self.raw & 0xFFFF).ljust(8, b"\x00")
+
+    def without(self, *flags: ErrorFlag) -> "Errors":
+        """This word with `flags` cleared — the payload that acknowledges them."""
+        mask = 0
+        for flag in flags:
+            mask |= 1 << int(flag)
+        return Errors(raw=self.raw & ~mask)
 
     @property
     def any(self) -> bool:
