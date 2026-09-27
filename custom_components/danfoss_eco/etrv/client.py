@@ -19,6 +19,7 @@ from typing import AsyncIterator
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 
 from ..const import (
     UUID_BATTERY_LEVEL,
@@ -102,6 +103,21 @@ class ETRVClient:
 
     async def connect(self) -> None:
         if self._client is not None and self._client.is_connected:
+            return
+        self._pin_sent = False
+        if isinstance(self._target, BLEDevice):
+            client = await establish_connection(
+                BleakClient,
+                self._target,
+                self._target.name or self._target.address,
+                max_attempts=1,
+            )
+            self._client = client
+            try:
+                await self._send_pin()
+            except Exception:
+                await self.disconnect()
+                raise
             return
         last: Exception | None = None
         for attempt in range(1, CONNECT_ATTEMPTS + 1):
