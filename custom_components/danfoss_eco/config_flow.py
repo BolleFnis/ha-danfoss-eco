@@ -45,7 +45,7 @@ from .schedule_text import DAY_TO_INDEX, format_day, parse_day
 _LOGGER = logging.getLogger(__name__)
 
 PAIR_TIMEOUT_S = 30.0
-PAIR_POLL_INTERVAL_S = 2.0
+PAIR_POLL_INTERVAL_S = 0.5
 
 
 def _is_etrv(adv: BluetoothServiceInfoBleak) -> bool:
@@ -127,11 +127,7 @@ class DanfossEcoConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors[CONF_PIN] = "invalid_pin"
                 pin = None  # type: ignore[assignment]
             address = self._discovered_address
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, address, connectable=True
-            )
-            target = ble_device or address
-            secret = await self._try_read_secret(target, pin) if pin else None
+            secret = await self._try_read_secret(address, pin) if pin else None
             if secret is not None:
                 return self.async_create_entry(
                     title=self._discovered_name or address,
@@ -159,7 +155,7 @@ class DanfossEcoConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _try_read_secret(self, target: Any, pin: str = DEFAULT_PIN) -> bytes | None:
+    async def _try_read_secret(self, address: str, pin: str = DEFAULT_PIN) -> bytes | None:
         """Connect repeatedly until we can read the plaintext secret_key char.
 
         The user is expected to short-press the TRV button while this is running.
@@ -168,7 +164,13 @@ class DanfossEcoConfigFlow(ConfigFlow, domain=DOMAIN):
         last_exc: Exception | None = None
         pin_bytes = pin.encode("ascii")
         while self.hass.loop.time() < deadline:
-            client = ETRVClient(target, secret_key=None, pin=pin_bytes)
+            ble_device = bluetooth.async_ble_device_from_address(
+                self.hass, address, connectable=True
+            )
+            if ble_device is None:
+                await asyncio.sleep(PAIR_POLL_INTERVAL_S)
+                continue
+            client = ETRVClient(ble_device, secret_key=None, pin=pin_bytes)
             try:
                 await client.connect()
                 sk = await client.read_secret_key()
@@ -272,4 +274,4 @@ class DanfossEcoOptionsFlow(OptionsFlow):
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(schema, defaults),
             errors=errors,
-        )
+              )
